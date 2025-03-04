@@ -82,6 +82,8 @@ class FluxSingleTransformerBlock(nn.Module):
         temb: torch.Tensor,
         image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         joint_attention_kwargs: Optional[Dict[str, Any]] = None,
+        gamma: float = 1.0,
+        add_it: bool = False,
     ) -> torch.Tensor:
         residual = hidden_states
         norm_hidden_states, gate = self.norm(hidden_states, emb=temb)
@@ -90,6 +92,8 @@ class FluxSingleTransformerBlock(nn.Module):
         attn_output = self.attn(
             hidden_states=norm_hidden_states,
             image_rotary_emb=image_rotary_emb,
+            gamma=gamma,
+            add_it=add_it,
             **joint_attention_kwargs,
         )
 
@@ -139,6 +143,8 @@ class FluxTransformerBlock(nn.Module):
         encoder_hidden_states: torch.Tensor,
         temb: torch.Tensor,
         image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        gamma: float = 1.0,
+        add_it: bool = False,
         joint_attention_kwargs: Optional[Dict[str, Any]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         norm_hidden_states, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.norm1(hidden_states, emb=temb)
@@ -152,6 +158,8 @@ class FluxTransformerBlock(nn.Module):
             hidden_states=norm_hidden_states,
             encoder_hidden_states=norm_encoder_hidden_states,
             image_rotary_emb=image_rotary_emb,
+            gamma=gamma,
+            add_it=add_it,
             **joint_attention_kwargs,
         )
 
@@ -392,6 +400,9 @@ class FluxTransformer2DModel(
         encoder_hidden_states: torch.Tensor = None,
         pooled_projections: torch.Tensor = None,
         timestep: torch.LongTensor = None,
+        add_it_multi: bool = False,
+        add_it_single: bool = False,
+        gamma: float = 1.0,
         img_ids: torch.Tensor = None,
         txt_ids: torch.Tensor = None,
         guidance: torch.Tensor = None,
@@ -443,7 +454,7 @@ class FluxTransformer2DModel(
                 )
 
         hidden_states = self.x_embedder(hidden_states)
-
+        
         timestep = timestep.to(hidden_states.dtype) * 1000
         if guidance is not None:
             guidance = guidance.to(hidden_states.dtype) * 1000
@@ -455,6 +466,7 @@ class FluxTransformer2DModel(
             if guidance is None
             else self.time_text_embed(timestep, guidance, pooled_projections)
         )
+        
         encoder_hidden_states = self.context_embedder(encoder_hidden_states)
 
         if txt_ids.ndim == 3:
@@ -477,7 +489,6 @@ class FluxTransformer2DModel(
             ip_adapter_image_embeds = joint_attention_kwargs.pop("ip_adapter_image_embeds")
             ip_hidden_states = self.encoder_hid_proj(ip_adapter_image_embeds)
             joint_attention_kwargs.update({"ip_hidden_states": ip_hidden_states})
-
         for index_block, block in enumerate(self.transformer_blocks):
             if torch.is_grad_enabled() and self.gradient_checkpointing:
                 encoder_hidden_states, hidden_states = self._gradient_checkpointing_func(
@@ -486,6 +497,8 @@ class FluxTransformer2DModel(
                     encoder_hidden_states,
                     temb,
                     image_rotary_emb,
+                    gamma,
+                    add_it_multi
                 )
 
             else:
@@ -495,6 +508,8 @@ class FluxTransformer2DModel(
                     temb=temb,
                     image_rotary_emb=image_rotary_emb,
                     joint_attention_kwargs=joint_attention_kwargs,
+                    gamma=gamma,
+                    add_it=add_it_multi
                 )
 
             # controlnet residual
@@ -517,6 +532,8 @@ class FluxTransformer2DModel(
                     hidden_states,
                     temb,
                     image_rotary_emb,
+                    gamma,
+                    add_it_single
                 )
 
             else:
@@ -525,6 +542,8 @@ class FluxTransformer2DModel(
                     temb=temb,
                     image_rotary_emb=image_rotary_emb,
                     joint_attention_kwargs=joint_attention_kwargs,
+                    gamma=gamma,
+                    add_it=add_it_single
                 )
 
             # controlnet residual

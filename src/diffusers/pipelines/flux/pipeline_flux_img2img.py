@@ -677,6 +677,10 @@ class FluxImg2ImgPipeline(DiffusionPipeline, FluxLoraLoaderMixin, FromSingleFile
         strength: float = 0.6,
         num_inference_steps: int = 28,
         sigmas: Optional[List[float]] = None,
+        add_it: bool = False,
+        gamma: float = 1.0,       
+        single_step: int = 340,
+        multi_step: int = 670,
         guidance_scale: float = 7.0,
         num_images_per_prompt: Optional[int] = 1,
         generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
@@ -691,6 +695,8 @@ class FluxImg2ImgPipeline(DiffusionPipeline, FluxLoraLoaderMixin, FromSingleFile
         negative_pooled_prompt_embeds: Optional[torch.FloatTensor] = None,
         output_type: Optional[str] = "pil",
         return_dict: bool = True,
+        source_noise: Optional[torch.FloatTensor] = None,
+        target_noise: Optional[torch.FloatTensor] = None,        
         joint_attention_kwargs: Optional[Dict[str, Any]] = None,
         callback_on_step_end: Optional[Callable[[int, int, Dict], None]] = None,
         callback_on_step_end_tensor_inputs: List[str] = ["latents"],
@@ -788,7 +794,6 @@ class FluxImg2ImgPipeline(DiffusionPipeline, FluxLoraLoaderMixin, FromSingleFile
             is True, otherwise a `tuple`. When returning a tuple, the first element is a list with the generated
             images.
         """
-
         height = height or self.default_sample_size * self.vae_scale_factor
         width = width or self.default_sample_size * self.vae_scale_factor
 
@@ -889,19 +894,31 @@ class FluxImg2ImgPipeline(DiffusionPipeline, FluxLoraLoaderMixin, FromSingleFile
 
         # 5. Prepare latent variables
         num_channels_latents = self.transformer.config.in_channels // 4
-
-        latents, latent_image_ids = self.prepare_latents(
-            init_image,
-            latent_timestep,
-            batch_size * num_images_per_prompt,
-            num_channels_latents,
-            height,
-            width,
-            prompt_embeds.dtype,
-            device,
-            generator,
-            latents,
-        )
+        if add_it:
+            if source_noise is None:
+                source_noise = randn_tensor( (1, num_channels_latents, 2 * (int(height) // (self.vae_scale_factor * 2)), 2 * (int(width) // (self.vae_scale_factor * 2))), generator=generator, device=device, dtype=prompt_embeds.dtype)
+            source_latent_ids = self._prepare_latent_image_ids(batch_size,  (int(height) // (self.vae_scale_factor * 2)), (int(width) // (self.vae_scale_factor * 2)), device, prompt_embeds.dtype)
+            image = init_image.to(device=device, dtype=prompt_embeds.dtype)
+            image_latents = self._encode_vae_image(image=image, generator=generator)
+            if target_noise is None:
+                target_noise = randn_tensor( (1, num_channels_latents, 2 * (int(height) // (self.vae_scale_factor * 2)), 2 * (int(width) // (self.vae_scale_factor * 2))), generator=generator, device=device, dtype=prompt_embeds.dtype)
+            image_latents_noise = self.scheduler.scale_noise(image_latents, latent_timestep, torch.cat([source_noise, target_noise], dim=0))
+            image_latents_noise = self._pack_latents(image_latents_noise, batch_size, num_channels_latents, 2 * (int(height) // (self.vae_scale_factor*2)), 2 * (int(width) // (self.vae_scale_factor*2)))
+            add_it_multi = True
+            add_it_single = True            
+        else:            
+            latents, latent_image_ids = self.prepare_latents(
+                init_image,
+                latent_timestep,
+                batch_size * num_images_per_prompt,
+                num_channels_latents,
+                height,
+                width,
+                prompt_embeds.dtype,
+                device,
+                generator,
+                latents,
+            )
 
         num_warmup_steps = max(len(timesteps) - num_inference_steps * self.scheduler.order, 0)
         self._num_timesteps = len(timesteps)
@@ -909,7 +926,7 @@ class FluxImg2ImgPipeline(DiffusionPipeline, FluxLoraLoaderMixin, FromSingleFile
         # handle guidance
         if self.transformer.config.guidance_embeds:
             guidance = torch.full([1], guidance_scale, device=device, dtype=torch.float32)
-            guidance = guidance.expand(latents.shape[0])
+            guidance = guidance.expand(len(prompt))
         else:
             guidance = None
 
@@ -951,18 +968,47 @@ class FluxImg2ImgPipeline(DiffusionPipeline, FluxLoraLoaderMixin, FromSingleFile
                 if image_embeds is not None:
                     self._joint_attention_kwargs["ip_adapter_image_embeds"] = image_embeds
                 # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
-                timestep = t.expand(latents.shape[0]).to(latents.dtype)
-                noise_pred = self.transformer(
-                    hidden_states=latents,
-                    timestep=timestep / 1000,
-                    guidance=guidance,
-                    pooled_projections=pooled_prompt_embeds,
-                    encoder_hidden_states=prompt_embeds,
-                    txt_ids=text_ids,
-                    img_ids=latent_image_ids,
-                    joint_attention_kwargs=self.joint_attention_kwargs,
-                    return_dict=False,
-                )[0]
+                timestep = t.expand(len(prompt)).to(prompt_embeds.dtype)
+                if add_it:
+                    
+                    if i == 0:
+                        latents = image_latents_noise
+                    else:
+                        image_latents_noise = self.scheduler.scale_noise(image_latents, timestep[:1], source_noise)
+                        image_latents_noise = self._pack_latents(image_latents_noise, 1, num_channels_latents, 2 * (int(height) // (self.vae_scale_factor*2)), 2 * (int(width) // (self.vae_scale_factor*2)))
+                        latents[:1] = image_latents_noise
+                    
+                    if t < multi_step:
+                        add_it_multi = False
+                    if t < single_step:
+                        add_it_single = False
+                    
+                    noise_pred = self.transformer(
+                        hidden_states=latents,
+                        timestep=timestep / 1000,
+                        guidance=guidance,
+                        pooled_projections=pooled_prompt_embeds,
+                        encoder_hidden_states=prompt_embeds,
+                        txt_ids=text_ids,
+                        add_it_multi=add_it_multi,
+                        add_it_single=add_it_single,
+                        gamma=gamma,
+                        img_ids=source_latent_ids,
+                        joint_attention_kwargs=self.joint_attention_kwargs,
+                        return_dict=False,
+                    )[0]
+                else:                
+                    noise_pred = self.transformer(
+                        hidden_states=latents,
+                        timestep=timestep / 1000,
+                        guidance=guidance,
+                        pooled_projections=pooled_prompt_embeds,
+                        encoder_hidden_states=prompt_embeds,
+                        txt_ids=text_ids,
+                        img_ids=latent_image_ids,
+                        joint_attention_kwargs=self.joint_attention_kwargs,
+                        return_dict=False,
+                    )[0]
 
                 if do_true_cfg:
                     if negative_image_embeds is not None:
@@ -1020,4 +1066,4 @@ class FluxImg2ImgPipeline(DiffusionPipeline, FluxLoraLoaderMixin, FromSingleFile
         if not return_dict:
             return (image,)
 
-        return FluxPipelineOutput(images=image)
+        return FluxPipelineOutput(images=image), target_noise

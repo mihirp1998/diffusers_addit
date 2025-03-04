@@ -2278,9 +2278,10 @@ class FluxAttnProcessor2_0:
         encoder_hidden_states: torch.FloatTensor = None,
         attention_mask: Optional[torch.FloatTensor] = None,
         image_rotary_emb: Optional[torch.Tensor] = None,
+        gamma: float = 1.0,
+        add_it: bool = False,
     ) -> torch.FloatTensor:
         batch_size, _, _ = hidden_states.shape if encoder_hidden_states is None else encoder_hidden_states.shape
-
         # `sample` projections.
         query = attn.to_q(hidden_states)
         key = attn.to_k(hidden_states)
@@ -2292,6 +2293,7 @@ class FluxAttnProcessor2_0:
         query = query.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
         key = key.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
         value = value.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+        image_rotary_emb_key = image_rotary_emb
 
         if attn.norm_q is not None:
             query = attn.norm_q(query)
@@ -2321,16 +2323,23 @@ class FluxAttnProcessor2_0:
                 encoder_hidden_states_key_proj = attn.norm_added_k(encoder_hidden_states_key_proj)
 
             # attention
-            query = torch.cat([encoder_hidden_states_query_proj, query], dim=2)
-            key = torch.cat([encoder_hidden_states_key_proj, key], dim=2)
-            value = torch.cat([encoder_hidden_states_value_proj, value], dim=2)
-
+            if add_it:
+                query = torch.cat([encoder_hidden_states_query_proj[1:], query[1:]], dim=2)
+                key = torch.cat([gamma * encoder_hidden_states_key_proj[1:], key[0:1], gamma * key[1:]], dim=2)
+                value = torch.cat([encoder_hidden_states_value_proj[1:], value[0:1], value[1:]], dim=2)
+                image_rotary_emb_key = [torch.cat([rot_emb[:encoder_hidden_states.shape[1]], rot_emb[encoder_hidden_states.shape[1]:], rot_emb[encoder_hidden_states.shape[1]:]], dim=0) for rot_emb in image_rotary_emb]
+                batch_size = 1
+            else:
+                query = torch.cat([encoder_hidden_states_query_proj, query], dim=2)
+                key = torch.cat([encoder_hidden_states_key_proj, key], dim=2)
+                value = torch.cat([encoder_hidden_states_value_proj, value], dim=2)                
+                
+        
         if image_rotary_emb is not None:
             from .embeddings import apply_rotary_emb
 
             query = apply_rotary_emb(query, image_rotary_emb)
-            key = apply_rotary_emb(key, image_rotary_emb)
-
+            key = apply_rotary_emb(key, image_rotary_emb_key)
         hidden_states = F.scaled_dot_product_attention(query, key, value, dropout_p=0.0, is_causal=False)
 
         hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim)
